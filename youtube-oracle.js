@@ -1,4 +1,4 @@
-// youtube-oracle.js — GCP-native Firestore + YouTube Mint Oracle (no service account)
+// zsLabTuB3 Oracle (zsT3): YouTube engagement mint oracle with on-chain emit, subscriber/view logging, and treasury-aware tokenomics
 
 require('dotenv').config();
 const { JsonRpcProvider, Wallet, Contract } = require('ethers');
@@ -9,11 +9,11 @@ const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const API_KEY = process.env.API_KEY; // YouTube Data API v3
+const API_KEY = process.env.API_KEY;
 
 const provider = new JsonRpcProvider(RPC_URL);
 const wallet = new Wallet(PRIVATE_KEY, provider);
-const contractABI = require('./tokenABI.json');
+const contractABI = require('../zTuB3-Diamondz-Contract/upgradeable-token/abi.json');
 const contract = new Contract(CONTRACT_ADDRESS, contractABI, wallet);
 
 const auth = new GoogleAuth({
@@ -45,6 +45,17 @@ async function getVideoStats(videoId, apiKey) {
   return res.data.items[0]?.statistics || {};
 }
 
+async function getSubscriberCount(channelId, apiKey) {
+  const res = await axios.get(`https://www.googleapis.com/youtube/v3/channels`, {
+    params: {
+      part: 'statistics',
+      id: channelId,
+      key: apiKey,
+    },
+  });
+  return parseInt(res.data.items[0]?.statistics?.subscriberCount || '0');
+}
+
 async function updateFirestore(videoId, views) {
   const client = await auth.getClient();
   const token = await client.getAccessToken();
@@ -69,7 +80,7 @@ async function updateFirestore(videoId, views) {
   }
 }
 
-async function logMintEvent(videoId, mintedAmount, txHash, title, skipped = false, viewsAdded = 0, totalViews = 0, gasUsed = null, gasPrice = null) {
+async function logMintEvent(videoId, mintedAmount, txHash, title, skipped = false, viewsAdded = 0, totalViews = 0, gasUsed = null, gasPrice = null, subs = null) {
   const client = await auth.getClient();
   const token = await client.getAccessToken();
 
@@ -87,6 +98,7 @@ async function logMintEvent(videoId, mintedAmount, txHash, title, skipped = fals
       skipped: { booleanValue: skipped },
       viewsAdded: { integerValue: viewsAdded.toString() },
       viewCount: { integerValue: totalViews.toString() },
+      ...(subs !== null && { subscriberCount: { integerValue: subs.toString() } }),
       ...(gasUsed && gasPrice && {
         gasUsed: { stringValue: gasUsed },
         gasPrice: { stringValue: gasPrice },
@@ -133,6 +145,7 @@ async function getFirestoreViews(videoId) {
 async function processEngagement() {
   console.log('🔍 Checking YouTube video stats...');
   const videos = await getLatestVideos(CHANNEL_ID, API_KEY);
+  const subs = await getSubscriberCount(CHANNEL_ID, API_KEY);
 
   for (const video of videos) {
     const id = video.id.videoId;
@@ -140,25 +153,31 @@ async function processEngagement() {
     const newViews = parseInt(stats.viewCount || '0');
     const previousViews = await getFirestoreViews(id);
     const delta = newViews - previousViews;
-
     const title = video.snippet.title || "Untitled";
 
     if (delta > 0) {
-      const tokensToMint = BigInt(Math.floor(delta / 20) * 5); // 5 tokens per 20 views
+      const tokensToMint = BigInt(Math.floor(delta / 20) * 5);
       try {
-        const tx = await contract.mint(wallet.address, tokensToMint);
+        const tx = await contract.mintFromOracle(
+          wallet.address,
+          tokensToMint,
+          id,
+          title,
+          newViews,
+          subs
+        );
         const receipt = await tx.wait();
         const gasUsed = receipt.gasUsed.toString();
         const gasPrice = tx.gasPrice?.toString() || '0';
 
         console.log(`✅ Minted ${tokensToMint} tokens to ${wallet.address}`);
         await updateFirestore(id, newViews);
-        await logMintEvent(id, tokensToMint, tx.hash, title, false, delta, newViews, gasUsed, gasPrice);
+        await logMintEvent(id, tokensToMint, tx.hash, title, false, delta, newViews, gasUsed, gasPrice, subs);
       } catch (err) {
         console.error(`❌ Minting failed:`, err);
       }
     } else {
-      await logMintEvent(id, 0, '', title, true, delta, newViews);
+      await logMintEvent(id, 0, '', title, true, delta, newViews, null, null, subs);
     }
   }
 }
